@@ -24,6 +24,37 @@ app = create_app()
 
 celery_app = Celery('data_ops', broker=CELERY_BROKER_URL)  # Use the imported broker URL
 
+@celery_app.task
+def store_data_background(data):
+    with db_write_lock:
+        logger.info(f"Storing data: {data}")
+        try:
+            timestamp = datetime.fromisoformat(data["timestamp"])
+            temperature = data["temperature"]
+            humidity = data["humidity"]
+            record = SensorData(timestamp=timestamp, temperature=temperature, humidity=humidity)
+            with db_session_scope() as session:
+                session.add(record)
+            logger.info("Data has been stored successfully in the background!")
+        except Exception as e:
+            logger.error(f"Error storing data: {e}")
+
+async def main_async_operations():
+    with app.app_context():
+        devices = await discover_devices()
+        if not devices:
+            logger.error("No devices found.")
+            return
+        target_name = current_app.config.get('DEVICE_NAME')
+        target_mac_address = current_app.config.get('TARGET_MAC_ADDRESS')
+        device = next((d for d in devices if target_name in d.name and target_mac_address in d.address), None)
+        if device:
+            await connect_to_device(device)
+            await scan_device()
+            await connect_to_gateway()
+        else:
+            logger.warning("Target device not found!")
+
 def extract_data_from_queue():
     try:
         data = data_queue.get(timeout=10)
@@ -35,20 +66,6 @@ def extract_data_from_queue():
         logging.error(f"Error during data extraction: {e}")
         return None
     return data
-
-def store_data(data):
-    with db_write_lock:
-        logger.info(f"Storing data: {data}")
-        try:
-            timestamp = datetime.fromisoformat(data["timestamp"])
-            temperature = data["temperature"]
-            humidity = data["humidity"]
-            record = SensorData(timestamp=timestamp, temperature=temperature, humidity=humidity)
-            with db_session_scope() as session:  # Using the context manager
-                session.add(record)
-            logger.info("Data has been stored successfully!")
-        except Exception as e:
-            logger.error(f"Error storing data: {e}")
 
 async def connect_to_device(device):
     with app.app_context():
@@ -112,29 +129,11 @@ async def connect_to_gateway():
 async def discover_devices():
     return await BleakScanner.discover()
 
-devices = asyncio.run(discover_devices())
-
-async def main_async_operations():
-    with app.app_context():
-        devices = await discover_devices()
-        if not devices:
-            logger.error("No devices found.")
-            return
-        target_name = current_app.config.get('DEVICE_NAME')
-        target_mac_address = current_app.config.get('TARGET_MAC_ADDRESS')
-        device = next((d for d in devices if target_name in d.name and target_mac_address in d.address), None)
-        if device:
-            await connect_to_device(device)
-            await scan_device()
-            await connect_to_gateway()
-        else:
-            logger.warning("Target device not found!")
-
 @Celery.task
-@copy_current_request_context
 def fetch_process_and_store_data():
     try:
-        data = connect_to_gateway()
+        # This function should be an async function or use asyncio.run if it's calling async functions
+        data = asyncio.run(connect_to_gateway())
         if not data:
             logger.error("No data received from the gateway.")
             return
@@ -143,7 +142,7 @@ def fetch_process_and_store_data():
             logger.error("Received invalid data.")
             return
         processed_data = process_data(extracted_data)
-        store_data(processed_data)
+        store_data_background(processed_data)
         logger.info("Data stored successfully.")
     except Exception as e:
         logger.error(f"Error processing or storing data: {e}")
@@ -152,30 +151,7 @@ def main_data_ops():
     with app.app_context():
         raw_data = data_queue.get(timeout=10)
         data = extract_data(raw_data)
-        store_data(data)
-
-celery_app = Celery('data_ops', broker='CELERY_BROKER_URL')
-
-@celery_app.task
-def store_data_background(data):
-    with db_write_lock:
-        logger.info(f"Storing data: {data}")
-        try:
-            timestamp = datetime.fromisoformat(data["timestamp"])
-            temperature = data["temperature"]
-            humidity = data["humidity"]
-            record = SensorData(timestamp=timestamp, temperature=temperature, humidity=humidity)
-            with db_session_scope() as session:
-                session.add(record)
-            logger.info("Data has been stored successfully in the background!")
-        except Exception as e:
-            logger.error(f"Error storing data: {e}")
+        store_data_background(data)
 
 if __name__ == "__main__":
-    discover_devices()  
     asyncio.run(main_async_operations())
-    extract_data_from_queue()
-
-
-
-
