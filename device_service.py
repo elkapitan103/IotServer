@@ -28,7 +28,29 @@ r = redis.StrictRedis(host='localhost', port=6379, db=0)
 r.setex("some_token_key", timedelta(minutes=30), "token_value")
 
 
+def get_redis_connection():
+    return redis.StrictRedis(host=config.REDIS_HOST, port=config.REDIS_PORT, db=config.REDIS_DB)
+
+# Usage
+r = get_redis_connection()
+r.setex("some_token_key", timedelta(minutes=30), "token_value")
+
+def validate_device(device):
+    """
+    Validate the device before storing it.
+    :param device: The device object to validate.
+    :return: Boolean indicating if the device is valid.
+    """
+    # Example validation criteria
+    return device.name is not None and device.address is not None
+
+
 def is_valid_mac_address(mac_address):
+    """
+    Validate the format of a MAC address.
+    :param mac_address: The MAC address to validate.
+    :return: Boolean indicating if the MAC address is valid.
+    """
     mac_regex = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$')
     return bool(mac_regex.match(mac_address))
 
@@ -56,33 +78,26 @@ def add_new_device(name, address, device_type):
 
 async def consolidated_device_discovery(selected_mac_address=None):
     try:
-        devices = await BleakScanner.discover()  
-        for device in devices:
-            new_device = DeviceMetadata(address=device.address, name=device.name)
-            success = add_to_db(new_device)
-            if not success:
-                current_app.logger.error(f"Failed to add device with address: {device.address}")
-            if selected_mac_address and device.address == selected_mac_address:
-                new_device.is_gateway = True
-                current_app.logger.info(f"Discovered gateway device: {device.address}")
-            else:
-                current_app.logger.info(f"Discovered device: {device.address}")
-                try:
-                    db.session.add(new_device)
-                    db.session.commit()
-                    current_app.logger.info(f"Successfully added device with MAC: {new_device.mac_address} to database.")
-                    success = add_to_db(new_device)
-                    if not success:
-                        return jsonify({"error": "Failed to add device"}), 500
-                except Exception as e:
-                    db.session.rollback()
-                    current_app.logger.error(f"Failed to add device with MAC: {new_device.mac_address}. Error: {e}")
-                    return jsonify({"error": "Failed to add device to the database"}), 500
-            current_app.logger.info(f"Total devices discovered: {len(devices)}")
+        devices = await BleakScanner.discover()
+        with db_session_scope() as session:
+            for device in devices:
+                if not validate_device(device):
+                    continue
+                existing_device = session.query(DeviceMetadata).filter_by(address=device.address).first()
+                if not existing_device:
+                    new_device = DeviceMetadata(address=device.address, name=device.name)
+                    session.add(new_device)
+                    if selected_mac_address and device.address == selected_mac_address:
+                        new_device.is_gateway = True
+                        current_app.logger.info(f"Discovered gateway device: {device.address}")
+                    else:
+                        current_app.logger.info(f"Discovered device: {device.address}")
+        current_app.logger.info(f"Total devices discovered: {len(devices)}")
     except SQLAlchemyError as e:
+        current_app.logger.error(f"Database error during device discovery: {e}")
         return handle_db_error(e)
     except Exception as e:
-        current_app.logger.error(f"Unexpected error: {e}")
+        current_app.logger.error(f"Unexpected error during device discovery: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
     
 def discover_services():
@@ -90,10 +105,10 @@ def discover_services():
         discovery_thread = threading.Thread(target=start_background_discovery_task, args=(current_app,))
         discovery_thread.daemon = True
         discovery_thread.start()
-        current_app.config['SELECTED_DEVICE_NAME'] = None
-        return render_template('index.html', devices=listener.available_devices)
+        return listener.available_devices
     except Exception as e:
         logger.error(f"Error in discover_services: {e}")
+        return jsonify({"error": "Failed to discover services"}), 500
 
 async def scan_bluetooth_devices(duration=10):
     try:
@@ -145,32 +160,31 @@ def discover_ble_devices():
         logger.error(f"Error during BLE device discovery: {e}")
         return []
     
-def store_device_to_db(device):
+def store_device(device):
+    """
+    Store the device in the database if it doesn't exist.
+    :param device: The device object to store.
+    :return: Boolean indicating success or failure.
+    """
     try:
-        with db() as session:
-            new_device = DeviceMetadata(address=device.address, name=device.name, is_gateway=device.is_gateway)
-            session.add(new_device)
-            session.commit()
-            logger.info(f"Successfully added device with MAC: {new_device.mac_address} to database.")
-            return True
-    except Exception as e:
-        logger.error(f"Failed to add device with MAC: {new_device.mac_address}. Error: {e}")
-        return False
-
-def store_discovered_device(device):
-    """Store the discovered device in the database if it doesn't exist."""
-    try: 
         with db_session_scope() as session:
             existing_device = session.query(DeviceMetadata).filter_by(address=device.address).first()
             if not existing_device:
                 new_device = DeviceMetadata(address=device.address, name=device.name, is_gateway=device.is_gateway)
                 session.add(new_device)
                 session.commit()
+                logger.info(f"Successfully added device with MAC: {new_device.mac_address} to database.")
                 return True
+            else:
+                logger.info(f"Device with MAC: {device.address} already exists in database.")
+                return False
+    except SQLAlchemyError as e:
+        logger.error(f"Database error: {e}")
         return False
     except Exception as e:
-        logger.error(f"Error while storing discovered device: {e}")
-        return None
+        logger.error(f"General error: {e}")
+        return False
+
 
 def device_exists(mac_address):
     """Check if a device with the given MAC address exists in the database."""
@@ -183,28 +197,31 @@ def device_exists(mac_address):
         return None
 
 async def select_ble_device(device_name, mac_address):
+    if not is_valid_mac_address(mac_address) or not is_valid_device_name(device_name):
+        return False, "Invalid MAC address or device name"
     try:
-        if not is_valid_mac_address(mac_address) or not is_valid_device_name(device_name):
-            return False, "Invalid MAC address or device name"
         async with BleakClient(mac_address) as client:
-            if not await client.is_connected():
+            await client.connect()
+            if client.is_connected:
+                return True, "Device selected successfully"
+            else:
                 return False, "Failed to connect to the device"
-        return True, "Device selected successfully"
     except BleakError as e:
         return False, f"BLE error: {str(e)}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
 def discover_and_store():
+    """
+    Discover devices and store them in the database.
+    :return: Tuple indicating success or failure and a message.
+    """
     try:
-        discovered_devices = discover_services()  # Your logic for discovering devices
-        with db() as session:
-            for device in discovered_devices:
-                existing_device = session.query(DeviceMetadata).filter_by(name=device.name).first()
-                if not existing_device:
-                    new_device = DeviceMetadata(name=device.name, address=device.address)
-                    session.add(new_device)
-                    session.commit()
+        discovered_devices = discover_services()
+        for device in discovered_devices:
+            if validate_device(device):
+                store_device(device)
         return True, "Devices discovered and stored successfully"
     except Exception as e:
+        logger.error(f"Error during device discovery: {str(e)}")
         return False, f"Error during device discovery: {str(e)}"
